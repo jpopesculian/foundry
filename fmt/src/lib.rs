@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 
+mod comments;
 mod formatter;
 mod helpers;
 pub mod solang_ext;

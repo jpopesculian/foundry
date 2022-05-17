@@ -7,6 +7,7 @@ use itertools::Itertools;
 use solang_parser::pt::*;
 
 use crate::{
+    comments::Comments,
     helpers,
     solang_ext::*,
     visit::{ParameterList, VResult, Visitable, Visitor},
@@ -55,10 +56,11 @@ pub struct Formatter<'a, W> {
     current_line: usize,
     bufs: Vec<FormatBuffer>,
     context: Context,
+    comments: Comments,
 }
 
 impl<'a, W: Write> Formatter<'a, W> {
-    pub fn new(w: &'a mut W, source: &'a str, config: FormatterConfig) -> Self {
+    pub fn new(w: &'a mut W, source: &'a str, comments: Comments, config: FormatterConfig) -> Self {
         Self {
             w,
             source,
@@ -68,6 +70,7 @@ impl<'a, W: Write> Formatter<'a, W> {
             bufs: Vec::new(),
             current_line: 0,
             context: Context::default(),
+            comments,
         }
     }
 
@@ -178,6 +181,56 @@ impl<'a, W: Write> Formatter<'a, W> {
     fn blank_lines(&self, a: Loc, b: Loc) -> usize {
         return self.source[a.end()..b.start()].matches('\n').count()
     }
+
+    fn write_postfix_comments_before(&mut self, byte: usize) -> std::fmt::Result {
+        while let Some(postfix) = self.comments.pop_postfix(byte) {
+            write!(self, " {}", postfix.comment)?;
+        }
+        Ok(())
+    }
+
+    fn write_prefix_comments_before(&mut self, byte: usize) -> std::fmt::Result {
+        if self.current_line > 0 && self.comments.peek_prefix(byte).is_some() {
+            writeln!(self)?;
+        }
+        while let Some(prefix) = self.comments.pop_prefix(byte) {
+            writeln!(self, "{}", prefix.comment)?;
+        }
+        Ok(())
+    }
+
+    fn write_chunk(
+        &mut self,
+        loc: Loc,
+        args: std::fmt::Arguments,
+        newline: bool,
+    ) -> std::fmt::Result {
+        self.write_postfix_comments_before(loc.start())?;
+        self.write_prefix_comments_before(loc.start())?;
+        if newline {
+            writeln!(self, "{}", args)
+        } else {
+            write!(self, "{}", args)
+        }
+    }
+}
+
+macro_rules! write_chunk {
+    ($self:ident, $loc:expr) => {
+        $self.write_chunk($loc, format_args!(""), false)
+    };
+    ($self:ident, $loc:expr, $($arg:tt)*) => {
+        $self.write_chunk($loc, format_args!($($arg)*), false)
+    };
+}
+
+macro_rules! writeln_chunk {
+    ($self:ident, $loc:expr) => {
+        $self.write_chunk($loc, format_args!(""), true)
+    };
+    ($self:ident, $loc:expr, $($arg:tt)*) => {
+        $self.write_chunk($loc, format_args!($($arg)*), true)
+    };
 }
 
 impl<'a, W: Write> Write for Formatter<'a, W> {
@@ -212,7 +265,7 @@ impl<'a, W: Write> Visitor for Formatter<'a, W> {
         let source = String::from_utf8(self.source.as_bytes()[loc.start()..loc.end()].to_vec())?;
         let mut lines = source.splitn(2, '\n');
 
-        write!(self, "{}", lines.next().unwrap())?;
+        write_chunk!(self, loc, "{}", lines.next().unwrap())?;
         if let Some(remainder) = lines.next() {
             // Call with `self.write_str` and not `write!`, so we can have `\n` at the beginning
             // without triggering an indentation
@@ -242,11 +295,11 @@ impl<'a, W: Write> Visitor for Formatter<'a, W> {
 
             unit.visit(self)?;
 
-            if !is_comment(unit) {
-                writeln!(self)?;
-            }
-
             if let Some(next_unit) = source_unit_parts_iter.peek() {
+                if !is_comment(unit) {
+                    writeln!(self)?;
+                }
+
                 // If source has zero blank lines between imports or errors, leave it as is. If one
                 // or more, separate with one blank line.
                 let separate = (is_import(unit) || is_error(unit)) &&
@@ -261,6 +314,9 @@ impl<'a, W: Write> Visitor for Formatter<'a, W> {
                 }
             }
         }
+
+        self.write_postfix_comments_before(self.source.as_bytes().len())?;
+        self.write_prefix_comments_before(self.source.as_bytes().len())?;
 
         Ok(())
     }
@@ -495,25 +551,25 @@ impl<'a, W: Write> Visitor for Formatter<'a, W> {
 
     fn visit_expr(&mut self, loc: Loc, expr: &mut Expression) -> VResult {
         match expr {
-            Expression::Type(_, typ) => match typ {
-                Type::Address => write!(self, "address")?,
-                Type::AddressPayable => write!(self, "address payable")?,
-                Type::Payable => write!(self, "payable")?,
-                Type::Bool => write!(self, "bool")?,
-                Type::String => write!(self, "string")?,
-                Type::Int(n) => write!(self, "int{}", n)?,
-                Type::Uint(n) => write!(self, "uint{}", n)?,
-                Type::Bytes(n) => write!(self, "bytes{}", n)?,
-                Type::Rational => write!(self, "rational")?,
-                Type::DynamicBytes => write!(self, "bytes")?,
-                Type::Mapping(_, from, to) => {
-                    write!(self, "mapping(")?;
+            Expression::Type(loc, typ) => match typ {
+                Type::Address => write_chunk!(self, *loc, "address")?,
+                Type::AddressPayable => write_chunk!(self, *loc, "address payable")?,
+                Type::Payable => write_chunk!(self, *loc, "payable")?,
+                Type::Bool => write_chunk!(self, *loc, "bool")?,
+                Type::String => write_chunk!(self, *loc, "string")?,
+                Type::Int(n) => write_chunk!(self, *loc, "int{}", n)?,
+                Type::Uint(n) => write_chunk!(self, *loc, "uint{}", n)?,
+                Type::Bytes(n) => write_chunk!(self, *loc, "bytes{}", n)?,
+                Type::Rational => write_chunk!(self, *loc, "rational")?,
+                Type::DynamicBytes => write_chunk!(self, *loc, "bytes")?,
+                Type::Mapping(loc, from, to) => {
+                    write_chunk!(self, *loc, "mapping(")?;
                     from.visit(self)?;
                     write!(self, " => ")?;
                     to.visit(self)?;
                     write!(self, ")")?;
                 }
-                Type::Function { .. } => self.visit_source(loc)?,
+                Type::Function { .. } => self.visit_source(*loc)?,
             },
             Expression::ArraySubscript(_, ty_exp, size_exp) => {
                 ty_exp.visit(self)?;
@@ -1197,9 +1253,11 @@ mod tests {
             }
         }
 
-        let (mut source_pt, _source_comments) = solang_parser::parse(source, 1).unwrap();
+        let (mut source_pt, source_comments) = solang_parser::parse(source, 1).unwrap();
+        let comments = Comments::new(source_comments, source);
+        println!("{:?}", source_pt);
 
-        let (expected_pt, _expected_comments) = solang_parser::parse(expected, 1).unwrap();
+        let (expected_pt, _) = solang_parser::parse(expected, 1).unwrap();
         if !source_pt.ast_eq(&expected_pt) {
             pretty_assertions::assert_eq!(
                 source_pt,
@@ -1210,10 +1268,11 @@ mod tests {
         }
 
         let mut result = String::new();
-        let mut f = Formatter::new(&mut result, source, config);
+        let mut f = Formatter::new(&mut result, source, comments, config);
 
         source_pt.visit(&mut f).unwrap();
 
+        println!("{}", result);
         let formatted = PrettyString(result);
         let expected = PrettyString(expected.trim_start().to_string());
 
@@ -1250,4 +1309,5 @@ mod tests {
     test_directory! { TypeDefinition }
     test_directory! { UsingDirective }
     test_directory! { VariableDefinition }
+    // test_directory! { SimpleComments }
 }
