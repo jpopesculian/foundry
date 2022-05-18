@@ -76,7 +76,7 @@ impl<'a, W: Write> Formatter<'a, W> {
         }
     }
 
-    fn level(&mut self) -> &mut usize {
+    fn level_mut(&mut self) -> &mut usize {
         if let Some(buf) = self.bufs.last_mut() {
             &mut buf.level
         } else {
@@ -84,14 +84,30 @@ impl<'a, W: Write> Formatter<'a, W> {
         }
     }
 
+    fn current_line(&self) -> usize {
+        if let Some(buf) = self.bufs.last() {
+            buf.current_line
+        } else {
+            self.current_line
+        }
+    }
+
+    fn level(&self) -> usize {
+        if let Some(buf) = self.bufs.last() {
+            buf.level
+        } else {
+            self.level
+        }
+    }
+
     fn indent(&mut self, delta: usize) {
-        let level = self.level();
+        let level = self.level_mut();
 
         *level += delta;
     }
 
     fn dedent(&mut self, delta: usize) {
-        let level = self.level();
+        let level = self.level_mut();
 
         *level -= delta;
     }
@@ -116,9 +132,13 @@ impl<'a, W: Write> Formatter<'a, W> {
 
     /// Length of the line `s` with respect to already written line and indentation
     fn len_indented_with_current(&self, s: impl AsRef<str>) -> usize {
-        (self.config.tab_width * self.level)
-            .saturating_add(self.current_line)
+        (self.config.tab_width * self.level())
+            .saturating_add(self.current_line())
             .saturating_add(s.as_ref().len())
+    }
+
+    fn is_beginning_of_line(&self) -> bool {
+        self.current_line() == 0
     }
 
     /// Is length of the `text` with respect to already written line <= `config.line_length`
@@ -173,10 +193,14 @@ impl<'a, W: Write> Formatter<'a, W> {
         visitable: &mut impl Visitable,
     ) -> Result<String, Box<dyn std::error::Error>> {
         let last_char = self.last_char.take();
+        let comments = self.comments.clone();
+
         self.bufs.push(FormatBuffer::default());
         visitable.visit(self)?;
         let buf = self.bufs.pop().unwrap();
+
         self.last_char = last_char;
+        self.comments = comments;
 
         Ok(buf.w)
     }
@@ -188,16 +212,16 @@ impl<'a, W: Write> Formatter<'a, W> {
 
     fn write_postfix_comments_before(&mut self, byte: usize) -> std::fmt::Result {
         while let Some(postfix) = self.comments.pop_postfix(byte) {
-            if self.current_line > 0 &&
+            if !self.is_beginning_of_line() &&
                 self.last_char.map(|ch| !ch.is_whitespace()).unwrap_or(false)
             {
                 write!(self, " ")?;
             }
             if postfix.is_line() {
-                writeln!(self, "{}", postfix.comment)?;
-            } else {
                 // TODO handle indent for blocks (most likely handled by some kind of block
                 // context)
+                writeln!(self, "{}", postfix.comment)?;
+            } else {
                 write!(self, "{}", postfix.comment)?;
             }
         }
@@ -205,7 +229,7 @@ impl<'a, W: Write> Formatter<'a, W> {
     }
 
     fn write_prefix_comments_before(&mut self, byte: usize) -> std::fmt::Result {
-        if self.current_line > 0 && self.comments.peek_prefix(byte).is_some() {
+        if !self.is_beginning_of_line() && self.comments.peek_prefix(byte).is_some() {
             writeln!(self)?;
         }
         while let Some(prefix) = self.comments.pop_prefix(byte) {
@@ -222,7 +246,6 @@ impl<'a, W: Write> Formatter<'a, W> {
     ) -> std::fmt::Result {
         self.write_postfix_comments_before(loc.start())?;
         self.write_prefix_comments_before(loc.start())?;
-        println!("write chunk: '{}'", args);
         if newline {
             writeln!(self, "{}", args)
         } else {
@@ -235,9 +258,9 @@ macro_rules! write_chunk {
     ($self:ident, $loc:expr) => {
         $self.write_chunk($loc, format_args!(""), false)
     };
-    ($self:ident, $loc:expr, $($arg:tt)*) => {
+    ($self:ident, $loc:expr, $($arg:tt)*) => {{
         $self.write_chunk($loc, format_args!($($arg)*), false)
-    };
+    }};
 }
 
 macro_rules! writeln_chunk {
@@ -318,7 +341,9 @@ impl<'a, W: Write> Visitor for Formatter<'a, W> {
             unit.visit(self)?;
 
             if let Some(next_unit) = source_unit_parts_iter.peek() {
-                if !is_comment(unit) {
+                self.write_postfix_comments_before(next_unit.loc().start())?;
+
+                if !is_comment(unit) && !self.is_beginning_of_line() {
                     writeln!(self)?;
                 }
 
@@ -337,9 +362,19 @@ impl<'a, W: Write> Visitor for Formatter<'a, W> {
             }
         }
 
-        self.write_postfix_comments_before(self.source.as_bytes().len())?;
-        self.write_prefix_comments_before(self.source.as_bytes().len())?;
-
+        let mut comments = self.comments.drain().into_iter().peekable();
+        while let Some(comment) = comments.next() {
+            if comment.is_prefix() {
+                writeln!(self)?;
+            } else if !self.is_beginning_of_line() {
+                write!(self, " ")?;
+            }
+            if comment.is_line() && comments.peek().is_some() {
+                writeln!(self, "{}", comment.comment)?;
+            } else {
+                write!(self, "{}", comment.comment)?;
+            }
+        }
         Ok(())
     }
 
@@ -735,17 +770,7 @@ impl<'a, W: Write> Visitor for Formatter<'a, W> {
     /// visit function regarding one line/multiline cases. We can transform it into one line later
     /// by `.split("\n").join(" ")`.
     fn visit_function_attribute_list(&mut self, list: &mut Vec<FunctionAttribute>) -> VResult {
-        let mut attributes = list
-            .iter_mut()
-            .sorted_by_key(|attribute| match attribute {
-                FunctionAttribute::Visibility(_) => 0,
-                FunctionAttribute::Mutability(_) => 1,
-                FunctionAttribute::Virtual(_) => 2,
-                FunctionAttribute::Immutable(_) => 3,
-                FunctionAttribute::Override(_, _) => 4,
-                FunctionAttribute::BaseOrModifier(_, _) => 5,
-            })
-            .peekable();
+        let mut attributes = list.iter_mut().attr_sorted().peekable();
 
         while let Some(attribute) = attributes.next() {
             attribute.visit(self)?;
@@ -1123,12 +1148,7 @@ impl<'a, W: Write> Visitor for Formatter<'a, W> {
         let attributes = var
             .attrs
             .iter_mut()
-            .sorted_by_key(|attribute| match attribute {
-                VariableAttribute::Visibility(_) => 0,
-                VariableAttribute::Constant(_) => 1,
-                VariableAttribute::Immutable(_) => 2,
-                VariableAttribute::Override(_) => 3,
-            })
+            .attr_sorted()
             .map(|attribute| match attribute {
                 VariableAttribute::Visibility(visibility) => visibility.to_string(),
                 VariableAttribute::Constant(_) => "constant".to_string(),
@@ -1168,16 +1188,16 @@ impl<'a, W: Write> Visitor for Formatter<'a, W> {
         if let Some(init) = &mut var.initializer {
             write!(self, " =")?;
 
-            let loc = init.loc();
-            let init = self.visit_to_string(init)?;
-            if self.will_it_fit(format!(" {init}")) {
-                write_chunk!(self, loc, " {init}")?;
+            let formatted_init = self.visit_to_string(init)?;
+            if self.will_it_fit(format!(" {}", formatted_init)) {
+                write_chunk!(self, init.loc(), " ")?;
+                init.visit(self)?;
             } else {
-                writeln!(self)?;
+                writeln_chunk!(self, init.loc())?;
                 if !multiline {
                     self.indent(1);
                 }
-                write_chunk!(self, loc, "{init}")?;
+                init.visit(self)?;
                 if !multiline {
                     self.dedent(1);
                 }
@@ -1278,7 +1298,6 @@ mod tests {
 
         let (mut source_pt, source_comments) = solang_parser::parse(source, 1).unwrap();
         let comments = Comments::new(source_comments, source);
-        println!("{:?}", source_pt);
 
         let (expected_pt, _) = solang_parser::parse(expected, 1).unwrap();
         if !source_pt.ast_eq(&expected_pt) {
@@ -1296,7 +1315,7 @@ mod tests {
         source_pt.visit(&mut f).unwrap();
 
         let formatted = PrettyString(result);
-        let expected = PrettyString(expected.trim_start().to_string());
+        let expected = PrettyString(expected.trim().to_string());
 
         pretty_assertions::assert_eq!(
             formatted,
