@@ -13,6 +13,12 @@ pub struct DestructuredComment {
     pub comment: String,
 }
 
+impl DestructuredComment {
+    pub fn is_line(&self) -> bool {
+        matches!(self.ty, CommentType::Line)
+    }
+}
+
 impl From<Comment> for DestructuredComment {
     fn from(comment: Comment) -> Self {
         match comment {
@@ -66,11 +72,15 @@ impl Comments {
     }
 
     pub(crate) fn peek_prefix(&mut self, byte: usize) -> Option<&DestructuredComment> {
-        if self.prefixes.first()?.loc.end() < byte {
-            self.prefixes.get(0)
-        } else {
-            None
-        }
+        self.prefixes.first().and_then(
+            |comment| {
+                if comment.loc.end() < byte {
+                    Some(comment)
+                } else {
+                    None
+                }
+            },
+        )
     }
 
     pub(crate) fn pop_postfix(&mut self, byte: usize) -> Option<DestructuredComment> {
@@ -80,25 +90,26 @@ impl Comments {
             None
         }
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
-
-    #[test]
-    fn comments() {
-        let src = std::fs::read_to_string(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("testdata")
-                .join("SimpleComments")
-                .join("original.sol"),
-        )
-        .unwrap();
-        let (mut pt, comments) = solang_parser::parse(&src, 1).unwrap();
-        let coms = Comments::new(comments, &src);
-        println!("{:?}", coms);
-        unimplemented!()
+    pub(crate) fn remove_comments_between(
+        &mut self,
+        range: impl std::ops::RangeBounds<usize>,
+    ) -> Vec<DestructuredComment> {
+        let mut prefixes = {
+            let (cleared, remaining) = std::mem::take(&mut self.prefixes)
+                .into_iter()
+                .partition(|comment| range.contains(&comment.loc.start()));
+            self.prefixes = remaining;
+            cleared
+        };
+        let mut postfixes = {
+            let (cleared, remaining) = std::mem::take(&mut self.postfixes)
+                .into_iter()
+                .partition(|comment| range.contains(&comment.loc.start()));
+            self.postfixes = remaining;
+            cleared
+        };
+        prefixes.append(&mut postfixes);
+        prefixes
     }
 }

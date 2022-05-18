@@ -57,6 +57,7 @@ pub struct Formatter<'a, W> {
     bufs: Vec<FormatBuffer>,
     context: Context,
     comments: Comments,
+    last_char: Option<char>,
 }
 
 impl<'a, W: Write> Formatter<'a, W> {
@@ -71,6 +72,7 @@ impl<'a, W: Write> Formatter<'a, W> {
             current_line: 0,
             context: Context::default(),
             comments,
+            last_char: None,
         }
     }
 
@@ -170,9 +172,11 @@ impl<'a, W: Write> Formatter<'a, W> {
         &mut self,
         visitable: &mut impl Visitable,
     ) -> Result<String, Box<dyn std::error::Error>> {
+        let last_char = self.last_char.take();
         self.bufs.push(FormatBuffer::default());
         visitable.visit(self)?;
         let buf = self.bufs.pop().unwrap();
+        self.last_char = last_char;
 
         Ok(buf.w)
     }
@@ -184,7 +188,18 @@ impl<'a, W: Write> Formatter<'a, W> {
 
     fn write_postfix_comments_before(&mut self, byte: usize) -> std::fmt::Result {
         while let Some(postfix) = self.comments.pop_postfix(byte) {
-            write!(self, " {}", postfix.comment)?;
+            if self.current_line > 0 &&
+                self.last_char.map(|ch| !ch.is_whitespace()).unwrap_or(false)
+            {
+                write!(self, " ")?;
+            }
+            if postfix.is_line() {
+                writeln!(self, "{}", postfix.comment)?;
+            } else {
+                // TODO handle indent for blocks (most likely handled by some kind of block
+                // context)
+                write!(self, "{}", postfix.comment)?;
+            }
         }
         Ok(())
     }
@@ -207,6 +222,7 @@ impl<'a, W: Write> Formatter<'a, W> {
     ) -> std::fmt::Result {
         self.write_postfix_comments_before(loc.start())?;
         self.write_prefix_comments_before(loc.start())?;
+        println!("write chunk: '{}'", args);
         if newline {
             writeln!(self, "{}", args)
         } else {
@@ -250,6 +266,10 @@ impl<'a, W: Write> Write for Formatter<'a, W> {
         }
         *current_line += s.len();
 
+        if let Some(last_char) = s.chars().next_back() {
+            self.last_char = Some(last_char);
+        }
+
         *pending_indent = s.ends_with('\n');
         if *pending_indent {
             *current_line = 0;
@@ -271,6 +291,8 @@ impl<'a, W: Write> Visitor for Formatter<'a, W> {
             // without triggering an indentation
             self.write_str(&format!("\n{remainder}"))?;
         }
+
+        let _ = self.comments.remove_comments_between(loc.start()..=loc.end());
 
         Ok(())
     }
@@ -1119,10 +1141,10 @@ impl<'a, W: Write> Visitor for Formatter<'a, W> {
 
         if !var.attrs.is_empty() {
             if multiline {
-                writeln!(self)?;
+                writeln_chunk!(self, var.loc)?;
                 self.indent(1);
             } else {
-                write!(self, " ")?;
+                write_chunk!(self, var.loc, " ")?;
             }
 
             self.write_items_separated(&attributes, " ", multiline)?;
@@ -1133,28 +1155,29 @@ impl<'a, W: Write> Visitor for Formatter<'a, W> {
             var.name.name,
             if var.initializer.is_some() { " =" } else { "" }
         )) {
-            write!(self, " {}", var.name.name)?;
+            write_chunk!(self, var.name.loc, " {}", var.name.name)?;
         } else {
-            writeln!(self)?;
+            writeln_chunk!(self, var.name.loc)?;
             if !multiline {
                 multiline = true;
                 self.indent(1);
             }
-            write!(self, "{}", var.name.name)?;
+            write_chunk!(self, var.name.loc, "{}", var.name.name)?;
         }
 
         if let Some(init) = &mut var.initializer {
             write!(self, " =")?;
 
+            let loc = init.loc();
             let init = self.visit_to_string(init)?;
             if self.will_it_fit(format!(" {init}")) {
-                write!(self, " {init}")?;
+                write_chunk!(self, loc, " {init}")?;
             } else {
                 writeln!(self)?;
                 if !multiline {
                     self.indent(1);
                 }
-                write!(self, "{init}")?;
+                write_chunk!(self, loc, "{init}")?;
                 if !multiline {
                     self.dedent(1);
                 }
@@ -1272,7 +1295,6 @@ mod tests {
 
         source_pt.visit(&mut f).unwrap();
 
-        println!("{}", result);
         let formatted = PrettyString(result);
         let expected = PrettyString(expected.trim_start().to_string());
 
@@ -1309,5 +1331,5 @@ mod tests {
     test_directory! { TypeDefinition }
     test_directory! { UsingDirective }
     test_directory! { VariableDefinition }
-    // test_directory! { SimpleComments }
+    test_directory! { SimpleComments }
 }
