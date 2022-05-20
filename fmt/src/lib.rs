@@ -6,5 +6,6 @@ mod helpers;
 pub mod solang_ext;
 mod visit;
 
+pub use comments::Comments;
 pub use formatter::{Formatter, FormatterConfig};
 pub use visit::{Visitable, Visitor};
