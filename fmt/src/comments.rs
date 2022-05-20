@@ -1,4 +1,5 @@
 use crate::solang_ext::*;
+use itertools::Itertools;
 use solang_parser::pt::*;
 
 #[derive(Debug, Clone, Copy)]
@@ -35,8 +36,15 @@ impl DestructuredComment {
     pub fn is_prefix(&self) -> bool {
         matches!(self.position, CommentPosition::Prefix)
     }
+    pub fn needs_newline(&self) -> bool {
+        self.is_line() || self.is_prefix()
+    }
+    pub fn is_before(&self, byte: usize) -> bool {
+        self.loc.start() < byte
+    }
 }
 
+/// Comments are stored in reverse order for easy removal
 #[derive(Debug, Clone)]
 pub struct Comments {
     prefixes: Vec<DestructuredComment>,
@@ -48,7 +56,7 @@ impl Comments {
         let mut prefixes = Vec::new();
         let mut postfixes = Vec::new();
 
-        for comment in comments {
+        for comment in comments.into_iter().rev() {
             if Self::is_newline_comment(&comment, src) {
                 prefixes.push(DestructuredComment::new(comment, CommentPosition::Prefix))
             } else {
@@ -70,17 +78,17 @@ impl Comments {
     }
 
     pub(crate) fn pop_prefix(&mut self, byte: usize) -> Option<DestructuredComment> {
-        if self.prefixes.first()?.loc.end() < byte {
-            Some(self.prefixes.remove(0))
+        if self.prefixes.last()?.is_before(byte) {
+            Some(self.prefixes.pop().unwrap())
         } else {
             None
         }
     }
 
     pub(crate) fn peek_prefix(&mut self, byte: usize) -> Option<&DestructuredComment> {
-        self.prefixes.first().and_then(
+        self.prefixes.last().and_then(
             |comment| {
-                if comment.loc.end() < byte {
+                if comment.is_before(byte) {
                     Some(comment)
                 } else {
                     None
@@ -90,33 +98,44 @@ impl Comments {
     }
 
     pub(crate) fn pop_postfix(&mut self, byte: usize) -> Option<DestructuredComment> {
-        if self.postfixes.first()?.loc.end() < byte {
-            Some(self.postfixes.remove(0))
+        if self.postfixes.last()?.is_before(byte) {
+            Some(self.postfixes.pop().unwrap())
         } else {
             None
         }
     }
 
-    pub(crate) fn remove_comments_between(
-        &mut self,
-        range: impl std::ops::RangeBounds<usize>,
-    ) -> Vec<DestructuredComment> {
-        let mut prefixes = {
-            let (cleared, remaining) = std::mem::take(&mut self.prefixes)
-                .into_iter()
-                .partition(|comment| range.contains(&comment.loc.start()));
-            self.prefixes = remaining;
-            cleared
-        };
-        let mut postfixes = {
-            let (cleared, remaining) = std::mem::take(&mut self.postfixes)
-                .into_iter()
-                .partition(|comment| range.contains(&comment.loc.start()));
-            self.postfixes = remaining;
-            cleared
-        };
-        prefixes.append(&mut postfixes);
-        prefixes
+    pub(crate) fn get_comments_before(&self, byte: usize) -> Vec<&DestructuredComment> {
+        let mut out = self
+            .prefixes
+            .iter()
+            .rev()
+            .take_while(|comment| comment.is_before(byte))
+            .chain(self.prefixes.iter().rev().take_while(|comment| comment.is_before(byte)))
+            .collect::<Vec<_>>();
+        out.sort_by_key(|comment| comment.loc.start());
+        out
+    }
+
+    pub(crate) fn remove_comments_before(&mut self, byte: usize) -> Vec<DestructuredComment> {
+        let mut out = self.prefixes.split_off(
+            self.prefixes
+                .iter()
+                .find_position(|comment| comment.is_before(byte))
+                .map(|(idx, _)| idx)
+                .unwrap_or_else(|| self.prefixes.len()),
+        );
+        out.append(
+            &mut self.postfixes.split_off(
+                self.postfixes
+                    .iter()
+                    .find_position(|comment| comment.is_before(byte))
+                    .map(|(idx, _)| idx)
+                    .unwrap_or_else(|| self.postfixes.len()),
+            ),
+        );
+        out.sort_by_key(|comment| comment.loc.start());
+        out
     }
 
     pub(crate) fn drain(&mut self) -> Vec<DestructuredComment> {

@@ -10,7 +10,7 @@ use crate::{
     comments::Comments,
     helpers,
     solang_ext::*,
-    visit::{ParameterList, VResult, Visitable, Visitor},
+    visit::{ParameterList, VError, VResult, Visitable, Visitor},
 };
 
 /// Contains the config and rule set
@@ -60,6 +60,38 @@ pub struct Formatter<'a, W> {
     last_char: Option<char>,
 }
 
+macro_rules! write_chunk {
+    ($self:ident, $loc:expr) => {{
+        println!("write_chunk[{}:{}]", file!(), line!());
+        $self.write_chunk($loc, format_args!(""), false)
+    }};
+    ($self:ident, $loc:expr, $($arg:tt)*) => {{
+        println!("write_chunk[{}:{}]", file!(), line!());
+        $self.write_chunk($loc, format_args!($($arg)*), false)
+    }};
+}
+
+macro_rules! writeln_chunk {
+    ($self:ident, $loc:expr) => {{
+        $self.write_chunk($loc, format_args!(""), true)
+    }};
+    ($self:ident, $loc:expr, $($arg:tt)*) => {{
+        println!("writeln_chunk[{}:{}]", file!(), line!());
+        $self.write_chunk($loc, format_args!($($arg)*), true)
+    }};
+}
+
+macro_rules! format_chunk {
+    ($self:ident, $loc:expr) => {{
+        println!("format chunk[{}:{}]", file!(), line!());
+        $self.chunk_to_string($loc, format_args!(""), false)
+    }};
+    ($self:ident, $loc:expr, $($arg:tt)*) => {{
+        println!("format chunk[{}:{}]", file!(), line!());
+        $self.chunk_to_string($loc, format_args!($($arg)*), false)
+    }};
+}
+
 impl<'a, W: Write> Formatter<'a, W> {
     pub fn new(w: &'a mut W, source: &'a str, comments: Comments, config: FormatterConfig) -> Self {
         Self {
@@ -73,6 +105,14 @@ impl<'a, W: Write> Formatter<'a, W> {
             context: Context::default(),
             comments,
             last_char: None,
+        }
+    }
+
+    fn buffer_mut(&mut self) -> &mut dyn Write {
+        if let Some(buf) = self.bufs.last_mut() {
+            &mut buf.w
+        } else {
+            &mut self.w
         }
     }
 
@@ -130,9 +170,13 @@ impl<'a, W: Write> Formatter<'a, W> {
         write!(self, "{}", if self.config.bracket_spacing { "{ }" } else { "{}" })
     }
 
+    fn current_indent_len(&self) -> usize {
+        self.config.tab_width * self.level()
+    }
+
     /// Length of the line `s` with respect to already written line and indentation
     fn len_indented_with_current(&self, s: impl AsRef<str>) -> usize {
-        (self.config.tab_width * self.level())
+        self.current_indent_len()
             .saturating_add(self.current_line())
             .saturating_add(s.as_ref().len())
     }
@@ -141,9 +185,32 @@ impl<'a, W: Write> Formatter<'a, W> {
         self.current_line() == 0
     }
 
+    fn last_char_is_whitespace(&self) -> bool {
+        self.last_char.map(|ch| ch.is_whitespace()).unwrap_or(true)
+    }
+
     /// Is length of the `text` with respect to already written line <= `config.line_length`
     fn will_it_fit(&self, text: impl AsRef<str>) -> bool {
+        if text.as_ref().contains('\n') {
+            return false
+        }
         self.len_indented_with_current(text) <= self.config.line_length
+    }
+
+    fn will_chunk_fit(&self, byte_end: usize, chunk: impl std::fmt::Display) -> bool {
+        let mut string = chunk.to_string();
+        if string.contains('\n') {
+            return false
+        }
+        // we don't care about order we just care about string length
+        for comment in self.comments.get_comments_before(byte_end) {
+            if comment.needs_newline() {
+                return false
+            } else {
+                string.push_str(&format!(" {} ", comment.comment))
+            }
+        }
+        self.will_it_fit(string)
     }
 
     /// Is length of the line consisting of `items` separated by `separator` with respect to
@@ -156,6 +223,43 @@ impl<'a, W: Write> Formatter<'a, W> {
         !self.will_it_fit(items.into_iter().join(separator))
     }
 
+    fn are_chunks_separated_multiline<'b>(
+        &self,
+        items: impl IntoIterator<Item = &'b (usize, impl std::fmt::Display + 'b)> + 'b,
+        separator: &str,
+    ) -> bool {
+        let mut string = String::new();
+        let mut items = items.into_iter().peekable();
+        let mut max_byte_end: Option<usize> = None;
+        while let Some((byte_end, item)) = items.next() {
+            // find end location of items
+            max_byte_end = Some(if let Some(old_max) = max_byte_end {
+                if *byte_end > old_max {
+                    *byte_end
+                } else {
+                    old_max
+                }
+            } else {
+                *byte_end
+            });
+            let item = item.to_string();
+            if item.contains('\n') {
+                return true
+            }
+            // create separated string
+            string.push_str(&item);
+            if items.peek().is_some() {
+                string.push_str(separator);
+            }
+        }
+        if let Some(byte_end) = max_byte_end {
+            !self.will_chunk_fit(byte_end, string)
+        } else {
+            // impllies empty items
+            false
+        }
+    }
+
     /// Write `items` with no separator with respect to `config.line_length` setting
     fn write_items(
         &mut self,
@@ -163,6 +267,14 @@ impl<'a, W: Write> Formatter<'a, W> {
         multiline: bool,
     ) -> std::fmt::Result {
         self.write_items_separated(items, "", multiline)
+    }
+
+    fn write_chunks<'b>(
+        &mut self,
+        items: impl IntoIterator<Item = &'b (usize, impl std::fmt::Display + 'b)> + 'b,
+        multiline: bool,
+    ) -> std::fmt::Result {
+        self.write_chunks_separated(items, "", multiline)
     }
 
     /// Write `items` separated by `separator` with respect to `config.line_length` setting
@@ -188,33 +300,58 @@ impl<'a, W: Write> Formatter<'a, W> {
         Ok(())
     }
 
-    fn visit_to_string(
+    /// Write `items` separated by `separator` with respect to `config.line_length` setting
+    fn write_chunks_separated<'b>(
         &mut self,
-        visitable: &mut impl Visitable,
-    ) -> Result<String, Box<dyn std::error::Error>> {
-        let last_char = self.last_char.take();
-        let comments = self.comments.clone();
+        items: impl IntoIterator<Item = &'b (usize, impl std::fmt::Display + 'b)> + 'b,
+        separator: &str,
+        multiline: bool,
+    ) -> std::fmt::Result {
+        let separator =
+            if multiline { format!("{}\n", separator.trim_end()) } else { separator.to_string() };
+        let mut items = items.into_iter().peekable();
+        while let Some((byte_end, item)) = items.next() {
+            write_chunk!(self, *byte_end, "{}", item)?;
 
+            if let Some((next_byte_end, _)) = items.peek() {
+                write!(self, "{}", separator)?;
+                write_chunk!(self, *next_byte_end)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn visit_to_string(&mut self, visitable: &mut impl Visitable) -> Result<String, VError> {
+        let last_char = self.last_char.take();
         self.bufs.push(FormatBuffer::default());
         visitable.visit(self)?;
         let buf = self.bufs.pop().unwrap();
-
         self.last_char = last_char;
-        self.comments = comments;
+        Ok(buf.w)
+    }
 
+    fn chunk_to_string(
+        &mut self,
+        byte_end: usize,
+        item: impl std::fmt::Display,
+    ) -> Result<String, VError> {
+        let last_char = self.last_char.take();
+        self.bufs.push(FormatBuffer::default());
+        self.write_chunk(byte_end, item, false)?;
+        let buf = self.bufs.pop().unwrap();
+        self.last_char = last_char;
         Ok(buf.w)
     }
 
     /// Returns number of blank lines between two LOCs
     fn blank_lines(&self, a: Loc, b: Loc) -> usize {
-        return self.source[a.end()..b.start()].matches('\n').count()
+        self.source[a.end()..b.start()].matches('\n').count()
     }
 
-    fn write_postfix_comments_before(&mut self, byte: usize) -> std::fmt::Result {
-        while let Some(postfix) = self.comments.pop_postfix(byte) {
-            if !self.is_beginning_of_line() &&
-                self.last_char.map(|ch| !ch.is_whitespace()).unwrap_or(false)
-            {
+    fn write_postfix_comments_before(&mut self, byte_end: usize) -> std::fmt::Result {
+        while let Some(postfix) = self.comments.pop_postfix(byte_end) {
+            if !self.is_beginning_of_line() && !self.last_char_is_whitespace() {
                 write!(self, " ")?;
             }
             if postfix.is_line() {
@@ -228,11 +365,11 @@ impl<'a, W: Write> Formatter<'a, W> {
         Ok(())
     }
 
-    fn write_prefix_comments_before(&mut self, byte: usize) -> std::fmt::Result {
-        if !self.is_beginning_of_line() && self.comments.peek_prefix(byte).is_some() {
+    fn write_prefix_comments_before(&mut self, byte_end: usize) -> std::fmt::Result {
+        if !self.is_beginning_of_line() && self.comments.peek_prefix(byte_end).is_some() {
             writeln!(self)?;
         }
-        while let Some(prefix) = self.comments.pop_prefix(byte) {
+        while let Some(prefix) = self.comments.pop_prefix(byte_end) {
             writeln!(self, "{}", prefix.comment)?;
         }
         Ok(())
@@ -240,62 +377,58 @@ impl<'a, W: Write> Formatter<'a, W> {
 
     fn write_chunk(
         &mut self,
-        loc: Loc,
-        args: std::fmt::Arguments,
+        byte_end: usize,
+        chunk: impl std::fmt::Display,
         newline: bool,
     ) -> std::fmt::Result {
-        self.write_postfix_comments_before(loc.start())?;
-        self.write_prefix_comments_before(loc.start())?;
+        let last_char_was_whitespace = self.last_char_is_whitespace();
+        self.write_postfix_comments_before(byte_end)?;
+        self.write_prefix_comments_before(byte_end)?;
+        if last_char_was_whitespace && !self.last_char_is_whitespace() {
+            write!(self, " ")?;
+        }
         if newline {
-            writeln!(self, "{}", args)
+            writeln!(self, "{}", chunk)
         } else {
-            write!(self, "{}", args)
+            write!(self, "{}", chunk)
         }
     }
-}
 
-macro_rules! write_chunk {
-    ($self:ident, $loc:expr) => {
-        $self.write_chunk($loc, format_args!(""), false)
-    };
-    ($self:ident, $loc:expr, $($arg:tt)*) => {{
-        $self.write_chunk($loc, format_args!($($arg)*), false)
-    }};
-}
-
-macro_rules! writeln_chunk {
-    ($self:ident, $loc:expr) => {
-        $self.write_chunk($loc, format_args!(""), true)
-    };
-    ($self:ident, $loc:expr, $($arg:tt)*) => {
-        $self.write_chunk($loc, format_args!($($arg)*), true)
-    };
+    fn write_raw(&mut self, s: impl AsRef<str>) -> std::fmt::Result {
+        self.buffer_mut().write_str(s.as_ref())
+    }
 }
 
 impl<'a, W: Write> Write for Formatter<'a, W> {
     fn write_str(&mut self, s: &str) -> std::fmt::Result {
-        let (level, current_line, pending_indent, w): (_, _, _, &mut dyn Write) =
+        let indent = " ".repeat(self.current_indent_len());
+        let (current_line, pending_indent, w): (_, _, &mut dyn Write) =
             if let Some(buf) = self.bufs.last_mut() {
-                (buf.level, &mut buf.current_line, &mut buf.pending_indent, &mut buf.w)
+                (&mut buf.current_line, &mut buf.pending_indent, &mut buf.w)
             } else {
-                (self.level, &mut self.current_line, &mut self.pending_indent, self.w)
+                (&mut self.current_line, &mut self.pending_indent, self.w)
             };
 
         if *pending_indent {
-            let indent = " ".repeat(self.config.tab_width * level);
             IndentWriter::new(&indent, w).write_str(s)?;
         } else {
-            w.write_str(s)?;
+            IndentWriter::new_skip_initial(&indent, w).write_str(s)?;
         }
-        *current_line += s.len();
 
         if let Some(last_char) = s.chars().next_back() {
             self.last_char = Some(last_char);
         }
 
-        *pending_indent = s.ends_with('\n');
-        if *pending_indent {
-            *current_line = 0;
+        if s.contains('\n') {
+            *pending_indent = s.ends_with('\n');
+            if *pending_indent {
+                *current_line = 0;
+            } else {
+                *current_line = s.lines().last().unwrap().len();
+            }
+        } else {
+            *pending_indent = false;
+            *current_line += s.len();
         }
 
         Ok(())
@@ -308,14 +441,14 @@ impl<'a, W: Write> Visitor for Formatter<'a, W> {
         let source = String::from_utf8(self.source.as_bytes()[loc.start()..loc.end()].to_vec())?;
         let mut lines = source.splitn(2, '\n');
 
-        write_chunk!(self, loc, "{}", lines.next().unwrap())?;
+        write_chunk!(self, loc.end(), "{}", lines.next().unwrap())?;
         if let Some(remainder) = lines.next() {
             // Call with `self.write_str` and not `write!`, so we can have `\n` at the beginning
             // without triggering an indentation
-            self.write_str(&format!("\n{remainder}"))?;
+            self.write_raw(&format!("\n{remainder}"))?;
         }
 
-        let _ = self.comments.remove_comments_between(loc.start()..=loc.end());
+        let _ = self.comments.remove_comments_before(loc.end());
 
         Ok(())
     }
@@ -405,7 +538,9 @@ impl<'a, W: Write> Visitor for Formatter<'a, W> {
                     }
                     write!(self, " */")?;
                 } else {
-                    write!(self, "/**{}*/", doc_comment.comment)?;
+                    write!(self, "/**")?;
+                    self.write_raw(&doc_comment.comment)?;
+                    write!(self, "*/")?;
                 }
             }
         }
@@ -429,10 +564,12 @@ impl<'a, W: Write> Visitor for Formatter<'a, W> {
     fn visit_contract(&mut self, contract: &mut ContractDefinition) -> VResult {
         self.context.contract = Some(contract.clone());
 
-        write!(self, "{} {} ", contract.ty, contract.name.name)?;
+        write_chunk!(self, contract.loc.start(), "{} ", contract.ty)?;
+        write_chunk!(self, contract.name.loc.end(), "{} ", contract.name.name)?;
 
         if !contract.base.is_empty() {
-            write!(self, "is")?;
+            // TODO check if chunk fits?
+            write_chunk!(self, contract.base.first().unwrap().loc.start(), "is")?;
 
             let bases = contract
                 .base
@@ -581,25 +718,28 @@ impl<'a, W: Write> Visitor for Formatter<'a, W> {
     }
 
     fn visit_enum(&mut self, enumeration: &mut EnumDefinition) -> VResult {
-        write!(self, "enum {} ", &enumeration.name.name)?;
+        write_chunk!(self, enumeration.loc.start(), "enum {} ", &enumeration.name.name)?;
 
         if enumeration.values.is_empty() {
             self.write_empty_brackets()?;
         } else {
-            writeln!(self, "{{")?;
+            // TODO rewrite with some enumeration
+            write!(self, "{{")?;
 
             self.indent(1);
             for (i, value) in enumeration.values.iter().enumerate() {
-                write!(self, "{}", &value.name)?;
+                writeln_chunk!(self, value.loc.start())?;
+                write_chunk!(self, value.loc.end(), "{}", &value.name)?;
 
                 if i != enumeration.values.len() - 1 {
                     write!(self, ",")?;
                 }
-
-                writeln!(self)?;
             }
             self.dedent(1);
 
+            self.write_postfix_comments_before(enumeration.loc.end())?;
+            self.write_prefix_comments_before(enumeration.loc.end())?;
+            writeln!(self)?;
             write!(self, "}}")?;
         }
 
@@ -609,18 +749,18 @@ impl<'a, W: Write> Visitor for Formatter<'a, W> {
     fn visit_expr(&mut self, loc: Loc, expr: &mut Expression) -> VResult {
         match expr {
             Expression::Type(loc, typ) => match typ {
-                Type::Address => write_chunk!(self, *loc, "address")?,
-                Type::AddressPayable => write_chunk!(self, *loc, "address payable")?,
-                Type::Payable => write_chunk!(self, *loc, "payable")?,
-                Type::Bool => write_chunk!(self, *loc, "bool")?,
-                Type::String => write_chunk!(self, *loc, "string")?,
-                Type::Int(n) => write_chunk!(self, *loc, "int{}", n)?,
-                Type::Uint(n) => write_chunk!(self, *loc, "uint{}", n)?,
-                Type::Bytes(n) => write_chunk!(self, *loc, "bytes{}", n)?,
-                Type::Rational => write_chunk!(self, *loc, "rational")?,
-                Type::DynamicBytes => write_chunk!(self, *loc, "bytes")?,
+                Type::Address => write_chunk!(self, loc.start(), "address")?,
+                Type::AddressPayable => write_chunk!(self, loc.start(), "address payable")?,
+                Type::Payable => write_chunk!(self, loc.start(), "payable")?,
+                Type::Bool => write_chunk!(self, loc.start(), "bool")?,
+                Type::String => write_chunk!(self, loc.start(), "string")?,
+                Type::Int(n) => write_chunk!(self, loc.start(), "int{}", n)?,
+                Type::Uint(n) => write_chunk!(self, loc.start(), "uint{}", n)?,
+                Type::Bytes(n) => write_chunk!(self, loc.start(), "bytes{}", n)?,
+                Type::Rational => write_chunk!(self, loc.start(), "rational")?,
+                Type::DynamicBytes => write_chunk!(self, loc.start(), "bytes")?,
                 Type::Mapping(loc, from, to) => {
-                    write_chunk!(self, *loc, "mapping(")?;
+                    write_chunk!(self, loc.start(), "mapping(")?;
                     from.visit(self)?;
                     write!(self, " => ")?;
                     to.visit(self)?;
@@ -639,6 +779,11 @@ impl<'a, W: Write> Visitor for Formatter<'a, W> {
             _ => self.visit_source(loc)?,
         };
 
+        Ok(())
+    }
+
+    fn visit_ident(&mut self, loc: Loc, ident: &mut Identifier) -> VResult {
+        write_chunk!(self, loc.end(), "{}", ident.name)?;
         Ok(())
     }
 
@@ -847,17 +992,17 @@ impl<'a, W: Write> Visitor for Formatter<'a, W> {
         if let Some(args) = &mut base.args {
             let args = args
                 .iter_mut()
-                .map(|arg| self.visit_to_string(arg))
-                .collect::<Result<Vec<_>, _>>()?;
+                .map(|arg| Ok((arg.loc().end(), self.visit_to_string(arg)?)))
+                .collect::<Result<Vec<_>, VError>>()?;
 
-            let multiline = self.is_separated_multiline(&args, ", ");
+            let multiline = self.are_chunks_separated_multiline(&args, ", ");
 
             if multiline {
                 writeln!(self)?;
                 self.indent(1);
             }
 
-            self.write_items_separated(&args, ", ", multiline)?;
+            self.write_chunks_separated(&args, ", ", multiline)?;
 
             if multiline {
                 self.dedent(1);
@@ -1145,6 +1290,7 @@ impl<'a, W: Write> Visitor for Formatter<'a, W> {
     fn visit_var_definition(&mut self, var: &mut VariableDefinition) -> VResult {
         var.ty.visit(self)?;
 
+        // TODO write chunks to string in order and then do sort
         let attributes = var
             .attrs
             .iter_mut()
@@ -1161,43 +1307,49 @@ impl<'a, W: Write> Visitor for Formatter<'a, W> {
 
         if !var.attrs.is_empty() {
             if multiline {
-                writeln_chunk!(self, var.loc)?;
+                writeln_chunk!(self, var.loc.end())?;
                 self.indent(1);
             } else {
-                write_chunk!(self, var.loc, " ")?;
+                write_chunk!(self, var.loc.end(), " ")?;
             }
 
             self.write_items_separated(&attributes, " ", multiline)?;
         }
 
-        if self.will_it_fit(format!(
-            " {}{}",
-            var.name.name,
-            if var.initializer.is_some() { " =" } else { "" }
-        )) {
-            write_chunk!(self, var.name.loc, " {}", var.name.name)?;
+        let variable = self.visit_to_string(&mut var.name)?;
+
+        if self.will_it_fit(&format!(" {}", variable)) {
+            write!(self, " {}", variable)?;
         } else {
-            writeln_chunk!(self, var.name.loc)?;
             if !multiline {
                 multiline = true;
                 self.indent(1);
             }
-            write_chunk!(self, var.name.loc, "{}", var.name.name)?;
+            write_chunk!(self, var.name.loc.end(), "\n{}", variable)?;
         }
 
         if let Some(init) = &mut var.initializer {
-            write!(self, " =")?;
+            let loc = LineOfCode::loc(init);
+
+            // does assignment with equals fit?
+            if self.will_chunk_fit(loc.start(), " =") {
+                write!(self, " =")?;
+                write_chunk!(self, loc.start())?;
+            } else {
+                writeln!(self, " =")?;
+                // write comments on new line
+                write_chunk!(self, loc.start())?
+            }
 
             let formatted_init = self.visit_to_string(init)?;
             if self.will_it_fit(format!(" {}", formatted_init)) {
-                write_chunk!(self, init.loc(), " ")?;
-                init.visit(self)?;
+                write!(self, " {}", formatted_init)?;
             } else {
-                writeln_chunk!(self, init.loc())?;
+                writeln!(self)?;
                 if !multiline {
                     self.indent(1);
                 }
-                init.visit(self)?;
+                write!(self, "{}", formatted_init)?;
                 if !multiline {
                     self.dedent(1);
                 }
@@ -1297,6 +1449,7 @@ mod tests {
         }
 
         let (mut source_pt, source_comments) = solang_parser::parse(source, 1).unwrap();
+        println!("{:?}", source_pt);
         let comments = Comments::new(source_comments, source);
 
         let (expected_pt, _) = solang_parser::parse(expected, 1).unwrap();
